@@ -20,6 +20,7 @@ import sys
 import subprocess
 from pathlib import Path
 import time
+import argparse
 
 # Kaggle paths (auto-detected from script location)
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -83,6 +84,40 @@ def train_cluster(cluster_id: int, train_data_path: str):
 
 def main():
     """Train all 7 clusters sequentially."""
+    parser = argparse.ArgumentParser(description="Train all CausalMamba denoiser models")
+
+    # Training hyperparameters
+    parser.add_argument("--epochs", type=int, default=CONFIG["epochs"], help="Maximum training epochs")
+    parser.add_argument("--lr", type=float, default=CONFIG["lr"], help="Learning rate")
+    parser.add_argument("--batch_size", type=int, default=CONFIG["batch_size"], help="Batch size")
+    parser.add_argument("--device", type=str, default=CONFIG["device"], help="Device (cuda/cpu)")
+    parser.add_argument("--window_size", type=int, default=CONFIG["window_size"], help="Window size")
+    parser.add_argument("--d_model", type=int, default=CONFIG["d_model"], help="Model dimension")
+    parser.add_argument("--n_layers", type=int, default=CONFIG["n_layers"], help="Number of layers")
+    parser.add_argument("--guidance_weight", type=float, default=CONFIG["guidance_weight"], help="Guidance loss weight")
+    parser.add_argument("--target_loss", type=float, default=CONFIG["target_loss"], help="Early stopping target loss")
+    parser.add_argument("--patience", type=int, default=CONFIG["patience"], help="Early stopping patience")
+
+    # Data split parameters
+    parser.add_argument("--train_ratio", type=float, default=CONFIG["train_ratio"], help="Train/val split ratio")
+    parser.add_argument("--embargo_days", type=int, default=CONFIG["embargo_days"], help="Embargo days between train/val")
+
+    args = parser.parse_args()
+
+    # Override CONFIG with command-line arguments
+    CONFIG["epochs"] = args.epochs
+    CONFIG["lr"] = args.lr
+    CONFIG["batch_size"] = args.batch_size
+    CONFIG["device"] = args.device
+    CONFIG["window_size"] = args.window_size
+    CONFIG["d_model"] = args.d_model
+    CONFIG["n_layers"] = args.n_layers
+    CONFIG["guidance_weight"] = args.guidance_weight
+    CONFIG["target_loss"] = args.target_loss
+    CONFIG["patience"] = args.patience
+    CONFIG["train_ratio"] = args.train_ratio
+    CONFIG["embargo_days"] = args.embargo_days
+
     print("""
     ╔══════════════════════════════════════════════════════════════╗
     ║  CausalMamba Denoiser Training - All Clusters                ║
