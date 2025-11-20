@@ -178,10 +178,10 @@ def train_epoch(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cluster_id", type=int, required=True, help="Cluster ID to train")
-    parser.add_argument("--data_path", type=str, default="TinyRecursiveModels/CSVs/train_only.csv")
-    parser.add_argument("--cluster_config", type=str, default="FinancialDenoising/clustering_results/cluster_assignments.json")
-    parser.add_argument("--output_dir", type=str, default="FinancialDenoising/trained_models")
+    parser.add_argument("--cluster_id", type=int, default=None, help="Cluster ID to train (0-6). If not specified, trains all clusters.")
+    parser.add_argument("--data_path", type=str, default="train_only.csv", help="Path to training data CSV")
+    parser.add_argument("--cluster_config", type=str, default="clustering_results/cluster_assignments.json", help="Path to cluster config JSON")
+    parser.add_argument("--output_dir", type=str, default="trained_models", help="Directory to save trained models")
     parser.add_argument("--window_size", type=int, default=60)
     parser.add_argument("--d_model", type=int, default=128)
     parser.add_argument("--n_layers", type=int, default=4)
@@ -200,11 +200,60 @@ def main():
     print("="*80)
     print("GROUP-SPECIFIC DENOISER TRAINING")
     print("="*80)
-    print(f"\nCluster ID: {args.cluster_id}")
-    print(f"Device: {args.device}")
 
     # Load cluster configuration
     cluster_config = load_cluster_config(Path(args.cluster_config))
+
+    # If cluster_id not specified, train all clusters
+    if args.cluster_id is None:
+        n_clusters = cluster_config['metadata']['n_clusters']
+        print(f"\nNo cluster_id specified → Training all {n_clusters} clusters")
+        print(f"Device: {args.device}")
+
+        import subprocess
+        import sys
+
+        for cluster_id in range(n_clusters):
+            print(f"\n{'='*80}")
+            print(f"Training Cluster {cluster_id}/{n_clusters-1}")
+            print(f"{'='*80}")
+
+            cmd = [
+                sys.executable,
+                __file__,
+                "--cluster_id", str(cluster_id),
+                "--data_path", args.data_path,
+                "--cluster_config", args.cluster_config,
+                "--output_dir", args.output_dir,
+                "--window_size", str(args.window_size),
+                "--d_model", str(args.d_model),
+                "--n_layers", str(args.n_layers),
+                "--batch_size", str(args.batch_size),
+                "--epochs", str(args.epochs),
+                "--lr", str(args.lr),
+                "--guidance_weight", str(args.guidance_weight),
+                "--accumulation_steps", str(args.accumulation_steps),
+                "--patience", str(args.patience),
+                "--min_delta", str(args.min_delta),
+                "--device", args.device,
+            ]
+
+            if args.target_loss is not None:
+                cmd.extend(["--target_loss", str(args.target_loss)])
+
+            result = subprocess.run(cmd)
+            if result.returncode != 0:
+                print(f"\n[ERROR] Cluster {cluster_id} failed!")
+
+        print(f"\n{'='*80}")
+        print(f"All clusters training completed!")
+        print(f"{'='*80}")
+        return
+
+    print(f"\nCluster ID: {args.cluster_id}")
+    print(f"Device: {args.device}")
+
+    # Get cluster features
     feature_names, cluster_type = get_cluster_features(cluster_config, args.cluster_id)
 
     print(f"Cluster type: {cluster_type}")
