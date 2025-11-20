@@ -99,6 +99,71 @@ class TimeSeriesWindowDataset(Dataset):
         return torch.FloatTensor(window_norm)  # [W, F]
 
 
+class ValidationDataset(Dataset):
+    """
+    Dataset for validation with targets for IC calculation.
+
+    Stores both feature windows and corresponding targets (forward_returns).
+    """
+
+    def __init__(
+        self,
+        data: pd.DataFrame,
+        feature_cols: list,
+        target_col: str = 'forward_returns',
+        window_size: int = 60,
+        stride: int = 1
+    ):
+        """
+        Args:
+            data: DataFrame with time series
+            feature_cols: List of feature column names
+            target_col: Target column name
+            window_size: Window size
+            stride: Stride for sliding window
+        """
+        self.window_size = window_size
+        self.feature_cols = feature_cols
+
+        # Extract feature data
+        feature_data = data[feature_cols].values  # [T, F]
+        feature_data = np.nan_to_num(feature_data, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Extract target data
+        target_data = data[target_col].values  # [T]
+        target_data = np.nan_to_num(target_data, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Create windows
+        self.windows = []
+        self.targets = []
+
+        for i in range(0, len(feature_data) - window_size + 1, stride):
+            window = feature_data[i:i + window_size]
+            # Target is at the last timestep (causal)
+            target = target_data[i + window_size - 1]
+
+            self.windows.append(window)
+            self.targets.append(target)
+
+        self.windows = np.array(self.windows, dtype=np.float32)  # [N, W, F]
+        self.targets = np.array(self.targets, dtype=np.float32)  # [N]
+
+    def __len__(self):
+        return len(self.windows)
+
+    def __getitem__(self, idx):
+        """Returns instance-normalized window and target."""
+        window = self.windows[idx].copy()  # [W, F]
+        target = self.targets[idx]
+
+        # Instance normalization
+        window_mean = window.mean()
+        window_std = window.std()
+        window_norm = (window - window_mean) / (window_std + 1e-6)
+
+        return torch.FloatTensor(window_norm), torch.FloatTensor([target])
+
+
 def load_cluster_config(config_path: Path):
     """Load cluster assignments from JSON."""
     with open(config_path, 'r') as f:
@@ -114,6 +179,101 @@ def get_cluster_features(cluster_config: dict, cluster_id: int):
 
     cluster_info = cluster_config['clusters'][cluster_key]
     return cluster_info['features'], cluster_info.get('type', 'random_walk')
+
+
+def denoise_single_window(
+    model: nn.Module,
+    window_norm: torch.Tensor,
+    sde: VPSDE,
+    device: str,
+    t: int = 500
+) -> torch.Tensor:
+    """
+    Denoise a single window using single-step inference.
+
+    Args:
+        model: Trained denoiser model
+        window_norm: Normalized window [W, F]
+        sde: VP-SDE instance
+        device: Device
+        t: Timestep to denoise from
+
+    Returns:
+        Denoised last row [F]
+    """
+    model.eval()
+    with torch.no_grad():
+        window_tensor = window_norm.unsqueeze(0).to(device)  # [1, W, F]
+        t_tensor = torch.full((1,), t, device=device, dtype=torch.long)
+
+        # Predict noise
+        predicted_noise = model(window_tensor, t_tensor)
+
+        # Recover clean signal using VP-SDE formula
+        alpha_bar = sde.alphas_cumprod[t_tensor]
+        while alpha_bar.dim() < window_tensor.dim():
+            alpha_bar = alpha_bar.unsqueeze(-1)
+
+        denoised_window = (window_tensor - torch.sqrt(1.0 - alpha_bar) * predicted_noise) / (torch.sqrt(alpha_bar) + 1e-8)
+        denoised_window = torch.clamp(denoised_window, -10, 10)
+
+        # Return last row only (causal)
+        return denoised_window[0, -1, :].cpu()  # [F]
+
+
+def compute_validation_ic(
+    model: nn.Module,
+    val_dataloader: DataLoader,
+    sde: VPSDE,
+    device: str
+) -> float:
+    """
+    Compute Information Coefficient (IC) on validation set.
+
+    IC = correlation between denoised features and forward_returns.
+
+    Args:
+        model: Trained denoiser model
+        val_dataloader: Validation dataloader (with targets)
+        sde: VP-SDE instance
+        device: Device
+
+    Returns:
+        Mean IC across all features
+    """
+    model.eval()
+
+    all_denoised = []
+    all_targets = []
+
+    with torch.no_grad():
+        for windows, targets in val_dataloader:
+            # Denoise each window
+            for i in range(windows.shape[0]):
+                window = windows[i]  # [W, F]
+                target = targets[i]  # [1]
+
+                denoised_last_row = denoise_single_window(model, window, sde, device)
+                all_denoised.append(denoised_last_row.numpy())
+                all_targets.append(target.item())
+
+    # Convert to numpy arrays
+    denoised_features = np.array(all_denoised)  # [N, F]
+    targets = np.array(all_targets)  # [N]
+
+    # Compute IC per feature
+    n_features = denoised_features.shape[1]
+    ics = []
+
+    for f in range(n_features):
+        feature_values = denoised_features[:, f]
+        # Pearson correlation
+        ic = np.corrcoef(feature_values, targets)[0, 1]
+        if not np.isnan(ic):
+            ics.append(ic)
+
+    # Return mean IC
+    return np.mean(ics) if len(ics) > 0 else 0.0
 
 
 def train_epoch(
@@ -190,6 +350,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cluster_id", type=int, default=None, help="Cluster ID to train (0-6). If not specified, trains all clusters.")
     parser.add_argument("--data_path", type=str, default="train_only.csv", help="Path to training data CSV")
+    parser.add_argument("--val_path", type=str, default=None, help="Path to validation data CSV (for IC monitoring)")
     parser.add_argument("--cluster_config", type=str, default="clustering_results/cluster_assignments.json", help="Path to cluster config JSON")
     parser.add_argument("--output_dir", type=str, default="trained_models", help="Directory to save trained models")
     parser.add_argument("--window_size", type=int, default=60)
@@ -247,6 +408,9 @@ def main():
                 "--min_delta", str(args.min_delta),
                 "--device", args.device,
             ]
+
+            if args.val_path is not None:
+                cmd.extend(["--val_path", args.val_path])
 
             if args.target_loss is not None:
                 cmd.extend(["--target_loss", str(args.target_loss)])
@@ -331,6 +495,35 @@ def main():
     # Initialize optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
+    # Load validation data (optional, for IC monitoring)
+    val_dataloader = None
+    if args.val_path is not None:
+        print(f"\nLoading validation data from {args.val_path}...")
+        val_df = pd.read_csv(args.val_path)
+        print(f"Loaded {len(val_df)} validation rows")
+
+        # Check if forward_returns exists
+        if 'forward_returns' not in val_df.columns:
+            print(f"⚠️  WARNING: 'forward_returns' column not found in validation data")
+            print(f"    IC monitoring will be disabled")
+        else:
+            val_dataset = ValidationDataset(
+                val_df,
+                feature_names,
+                target_col='forward_returns',
+                window_size=args.window_size,
+                stride=1
+            )
+            val_dataloader = DataLoader(
+                val_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=True if args.device == "cuda" else False
+            )
+            print(f"Created {len(val_dataset)} validation windows")
+            print(f"✓ Validation IC monitoring enabled")
+
     # Learning rate scheduler with warmup
     def get_lr_scale(epoch, warmup_epochs=5):
         """Linear warmup then constant"""
@@ -343,6 +536,8 @@ def main():
     if args.target_loss is not None:
         print(f"  Target MSE loss: {args.target_loss:.6f} (early stop when reached)")
     print(f"  Patience: {args.patience} epochs (stop if no improvement)")
+    if val_dataloader is not None:
+        print(f"  Validation IC monitoring: enabled")
 
     best_mse = float('inf')
     epochs_without_improvement = 0
@@ -355,7 +550,13 @@ def main():
 
         avg_mse, avg_guide, avg_total = train_epoch(model, dataloader, sde, loss_fn, optimizer, args.device, args.accumulation_steps)
 
-        print(f"Epoch {epoch+1}/{args.epochs} - MSE: {avg_mse:.6f}, Guidance: {avg_guide:.6f}, Total: {avg_total:.6f}, LR: {args.lr * lr_scale:.6f}")
+        # Compute validation IC (if available)
+        val_ic = None
+        if val_dataloader is not None:
+            val_ic = compute_validation_ic(model, val_dataloader, sde, args.device)
+            print(f"Epoch {epoch+1}/{args.epochs} - MSE: {avg_mse:.6f}, Guidance: {avg_guide:.6f}, Total: {avg_total:.6f}, Val IC: {val_ic:.4f}, LR: {args.lr * lr_scale:.6f}")
+        else:
+            print(f"Epoch {epoch+1}/{args.epochs} - MSE: {avg_mse:.6f}, Guidance: {avg_guide:.6f}, Total: {avg_total:.6f}, LR: {args.lr * lr_scale:.6f}")
 
         # Check for improvement (based on MSE only)
         if avg_mse < best_mse - args.min_delta:
@@ -367,7 +568,7 @@ def main():
             output_dir.mkdir(parents=True, exist_ok=True)
 
             checkpoint_path = output_dir / f"cluster_{args.cluster_id}_best.pt"
-            torch.save({
+            checkpoint_data = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
@@ -382,7 +583,10 @@ def main():
                 'd_model': args.d_model,
                 'n_layers': args.n_layers,
                 'normalization_type': 'instance',
-            }, checkpoint_path)
+            }
+            if val_ic is not None:
+                checkpoint_data['val_ic'] = val_ic
+            torch.save(checkpoint_data, checkpoint_path)
 
             print(f"  → Saved checkpoint to {checkpoint_path}")
 

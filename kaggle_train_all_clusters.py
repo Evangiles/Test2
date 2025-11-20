@@ -42,7 +42,7 @@ CONFIG = {
     "embargo_days": 0,   # Buffer days between train/val
 }
 
-def train_cluster(cluster_id: int, train_data_path: str):
+def train_cluster(cluster_id: int, train_data_path: str, val_data_path: str = None):
     """Train a single cluster."""
     print(f"\n{'='*80}")
     print(f"Training Cluster {cluster_id}")
@@ -72,6 +72,10 @@ def train_cluster(cluster_id: int, train_data_path: str):
         "--target_loss", str(CONFIG["target_loss"]),
         "--patience", str(CONFIG["patience"]),
     ]
+
+    # Add validation path if provided
+    if val_data_path is not None:
+        cmd.extend(["--val_path", val_data_path])
 
     try:
         result = subprocess.run(cmd, check=True, capture_output=False, text=True)
@@ -180,8 +184,8 @@ def main():
     total_start = time.time()
     results = {}
 
-    for cluster_id in range(7):
-        success = train_cluster(cluster_id, train_data_path)
+    for cluster_id in range(5):  # Changed from 7 to 5 (k=5 clustering)
+        success = train_cluster(cluster_id, train_data_path, val_data_path)
         results[cluster_id] = success
 
         if not success:
@@ -202,7 +206,7 @@ def main():
         print(f"  Cluster {cluster_id}: {status}")
 
     successful = sum(results.values())
-    print(f"\nSuccessful: {successful}/7 clusters")
+    print(f"\nSuccessful: {successful}/5 clusters")
 
     # Save artifacts info
     print(f"\n[INFO] Model checkpoints saved to:")
