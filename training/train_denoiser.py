@@ -25,7 +25,8 @@ sys.path.append(str(Path(__file__).parent.parent))
 from models.diffusion_mamba import (
     CausalMambaDenoiser,
     VPSDE,
-    DenoisingLoss
+    DenoisingLoss,
+    denoise_single_window_iterative
 )
 
 
@@ -186,39 +187,38 @@ def denoise_single_window(
     window_norm: torch.Tensor,
     sde: VPSDE,
     device: str,
-    t: int = 500
+    num_steps: int = 10,
+    noise_level: int = 500,
+    eta_tv: float = 0.01,
+    eta_fourier: float = 0.01
 ) -> torch.Tensor:
     """
-    Denoise a single window using single-step inference.
+    Denoise a single window using iterative denoising with guidance.
+
+    Paper Algorithm 2: Iterative denoising with TV and Fourier guidance.
 
     Args:
         model: Trained denoiser model
         window_norm: Normalized window [W, F]
         sde: VP-SDE instance
         device: Device
-        t: Timestep to denoise from
+        num_steps: Number of denoising iterations (default: 10)
+        noise_level: Initial noise level T' (default: 500)
+        eta_tv: TV guidance strength (default: 0.01)
+        eta_fourier: Fourier guidance strength (default: 0.01)
 
     Returns:
         Denoised last row [F]
     """
-    model.eval()
-    with torch.no_grad():
-        window_tensor = window_norm.unsqueeze(0).to(device)  # [1, W, F]
-        t_tensor = torch.full((1,), t, device=device, dtype=torch.long)
-
-        # Predict noise
-        predicted_noise = model(window_tensor, t_tensor)
-
-        # Recover clean signal using VP-SDE formula
-        alpha_bar = sde.alphas_cumprod[t_tensor]
-        while alpha_bar.dim() < window_tensor.dim():
-            alpha_bar = alpha_bar.unsqueeze(-1)
-
-        denoised_window = (window_tensor - torch.sqrt(1.0 - alpha_bar) * predicted_noise) / (torch.sqrt(alpha_bar) + 1e-8)
-        denoised_window = torch.clamp(denoised_window, -10, 10)
-
-        # Return last row only (causal)
-        return denoised_window[0, -1, :].cpu()  # [F]
+    # Use iterative denoising (Algorithm 2)
+    return denoise_single_window_iterative(
+        model, window_norm, sde,
+        num_steps=num_steps,
+        noise_level=noise_level,
+        eta_tv=eta_tv,
+        eta_fourier=eta_fourier,
+        device=device
+    )
 
 
 def compute_validation_ic(
@@ -359,7 +359,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=100, help="Maximum training epochs")
     parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
-    parser.add_argument("--guidance_weight", type=float, default=0.1)
+    parser.add_argument("--guidance_weight", type=float, default=0.0)  # Paper: NO guidance in training
     parser.add_argument("--accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
     parser.add_argument("--target_loss", type=float, default=None, help="Stop when loss reaches this value (early stopping)")
     parser.add_argument("--patience", type=int, default=15, help="Early stopping patience (epochs without improvement)")

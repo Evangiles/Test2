@@ -31,7 +31,7 @@ from tqdm import tqdm
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
 
-from models.diffusion_mamba import CausalMambaDenoiser, VPSDE
+from models.diffusion_mamba import CausalMambaDenoiser, VPSDE, denoise_single_window_iterative
 
 
 def load_cluster_config(config_path: Path):
@@ -66,14 +66,16 @@ def denoise_single_window(
     num_steps: int = 50
 ) -> np.ndarray:
     """
-    Denoise a single window using INSTANCE NORMALIZATION.
+    Denoise a single window using ITERATIVE DENOISING with INSTANCE NORMALIZATION.
+
+    Paper Algorithm 2: Iterative denoising with TV and Fourier guidance.
 
     Args:
         model: Trained CausalMambaDenoiser
         window_raw: [window_size, n_features] RAW (unnormalized)
         sde: VP-SDE for reverse diffusion
         device: Device
-        num_steps: Number of denoising steps (currently unused, for future DDIM)
+        num_steps: Number of iterative denoising steps (default 50)
 
     Returns:
         Last row of denoised window [n_features] in ORIGINAL SCALE
@@ -84,24 +86,20 @@ def denoise_single_window(
     window_norm = (window_raw - window_mean) / (window_std + 1e-6)
 
     # Convert to tensor
-    window_tensor = torch.FloatTensor(window_norm).unsqueeze(0).to(device)  # [1, W, F]
+    window_tensor = torch.FloatTensor(window_norm).to(device)  # [W, F]
 
-    # Denoise at middle timestep (single-step for now)
-    t = torch.full((1,), sde.num_timesteps // 2, device=device, dtype=torch.long)
-
-    # Model predicts NOISE (not clean signal!)
-    predicted_noise = model(window_tensor, t)  # [1, W, F]
-
-    # Recover clean signal using VP-SDE formula
-    alpha_bar = sde.alphas_cumprod[t]
-    while alpha_bar.dim() < window_tensor.dim():
-        alpha_bar = alpha_bar.unsqueeze(-1)
-
-    denoised_window_norm = (window_tensor - torch.sqrt(1.0 - alpha_bar) * predicted_noise) / (torch.sqrt(alpha_bar) + 1e-8)
-    denoised_window_norm = torch.clamp(denoised_window_norm, -10, 10)  # Stability
-
-    # Extract last row (causal!)
-    denoised_last_norm = denoised_window_norm[0, -1, :].cpu().numpy()  # [F]
+    # Use iterative denoising with guidance (Algorithm 2 from paper)
+    # Training had NO guidance, but inference uses TV + Fourier guidance
+    denoised_last_norm = denoise_single_window_iterative(
+        model=model,
+        window_norm=window_tensor,
+        sde=sde,
+        num_steps=num_steps,
+        noise_level=sde.num_timesteps // 2,  # Start from middle timestep
+        eta_tv=0.01,        # TV guidance strength
+        eta_fourier=0.01,   # Fourier guidance strength
+        device=device
+    ).numpy()  # [F]
 
     # DENORMALIZE back to original scale
     denoised_last = denoised_last_norm * window_std + window_mean

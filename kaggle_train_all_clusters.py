@@ -35,7 +35,7 @@ CONFIG = {
     "window_size": 60,
     "d_model": 128,
     "n_layers": 4,
-    "guidance_weight": 0.1,
+    "guidance_weight": 0.0,  # Paper: NO guidance in training, only in inference
     "target_loss": 0.2,  # Early stopping: stop when loss reaches this value
     "patience": 15,      # Early stopping: stop if no improvement for N epochs
     "train_ratio": 0.8,  # 80% train, 20% val
