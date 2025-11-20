@@ -2,12 +2,17 @@
 Kaggle Notebook Training Script for CausalMamba Denoisers
 
 Usage in Kaggle:
-1. Upload FinancialDenoising folder to Kaggle Dataset
-2. Add TRMwithQuant data as dataset
-3. Create new GPU notebook (T4 or P100)
-4. Run this script
+1. Upload FinancialDenoising folder (with train.csv) to Kaggle Dataset
+2. Create new GPU notebook (T4 or P100)
+3. Run this script
 
 Estimated time: 6-9 hours (T4 GPU)
+
+This script will:
+- Load train.csv
+- Split into train/val (80/20, Purged Embargo Walk-Forward)
+- Train 7 CausalMamba models (one per feature cluster)
+- Save trained models to trained_models/
 """
 
 import os
@@ -16,9 +21,9 @@ import subprocess
 from pathlib import Path
 import time
 
-# Kaggle paths (adjust based on your dataset setup)
+# Kaggle paths (auto-detected)
 PROJECT_ROOT = "/kaggle/working/FinancialDenoising"
-DATA_PATH = "/kaggle/input/your-data/train_only.csv"  # Adjust this!
+TRAIN_CSV_PATH = f"{PROJECT_ROOT}/train.csv"  # Should be in uploaded dataset
 
 # Training configuration
 CONFIG = {
@@ -29,9 +34,11 @@ CONFIG = {
     "d_model": 128,
     "n_layers": 4,
     "guidance_weight": 0.1,
+    "train_ratio": 0.8,  # 80% train, 20% val
+    "embargo_days": 0,   # Buffer days between train/val
 }
 
-def train_cluster(cluster_id: int):
+def train_cluster(cluster_id: int, train_data_path: str):
     """Train a single cluster."""
     print(f"\n{'='*80}")
     print(f"Training Cluster {cluster_id}")
@@ -43,7 +50,7 @@ def train_cluster(cluster_id: int):
         "python",
         f"{PROJECT_ROOT}/training/train_denoiser.py",
         "--cluster_id", str(cluster_id),
-        "--data_path", DATA_PATH,
+        "--data_path", train_data_path,
         "--epochs", str(CONFIG["epochs"]),
         "--batch_size", str(CONFIG["batch_size"]),
         "--device", CONFIG["device"],
@@ -72,27 +79,62 @@ def main():
     ╚══════════════════════════════════════════════════════════════╝
     """)
 
-    # Check environment
-    print("[INFO] Checking environment...")
-    print(f"  Project root: {PROJECT_ROOT}")
-    print(f"  Data path: {DATA_PATH}")
-    print(f"  Device: {CONFIG['device']}")
-
-    if not os.path.exists(DATA_PATH):
-        print(f"\n[ERROR] Data file not found: {DATA_PATH}")
-        print("Please update DATA_PATH in this script!")
-        return
-
     # Change to project directory
     os.chdir(PROJECT_ROOT)
     sys.path.insert(0, PROJECT_ROOT)
 
-    # Train all clusters
+    # Check environment
+    print("[INFO] Checking environment...")
+    print(f"  Project root: {PROJECT_ROOT}")
+    print(f"  Train CSV: {TRAIN_CSV_PATH}")
+    print(f"  Device: {CONFIG['device']}")
+
+    if not os.path.exists(TRAIN_CSV_PATH):
+        print(f"\n[ERROR] Data file not found: {TRAIN_CSV_PATH}")
+        print("Please ensure train.csv is in the uploaded dataset!")
+        return
+
+    # Step 1: Load and split data
+    print(f"\n{'='*80}")
+    print("Step 1: Loading and splitting data")
+    print(f"{'='*80}\n")
+
+    try:
+        # Import data utilities
+        from utils.data_utils import load_and_split
+
+        # Load and split
+        train_df, val_df = load_and_split(
+            TRAIN_CSV_PATH,
+            train_ratio=CONFIG["train_ratio"],
+            embargo_days=CONFIG["embargo_days"],
+            save_splits=True,
+            output_dir=PROJECT_ROOT
+        )
+
+        train_data_path = f"{PROJECT_ROOT}/train_only.csv"
+        val_data_path = f"{PROJECT_ROOT}/val_only.csv"
+
+        print(f"\n[OK] Data split completed")
+        print(f"  Train: {train_data_path}")
+        print(f"  Val: {val_data_path}")
+
+    except Exception as e:
+        print(f"\n[ERROR] Failed to split data: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+
+    # Step 2: Train all clusters
+    print(f"\n{'='*80}")
+    print("Step 2: Training all clusters")
+    print(f"{'='*80}\n")
+
     total_start = time.time()
     results = {}
 
     for cluster_id in range(7):
-        success = train_cluster(cluster_id)
+        success = train_cluster(cluster_id, train_data_path)
         results[cluster_id] = success
 
         if not success:
@@ -104,7 +146,10 @@ def main():
     print("Training Summary")
     print(f"{'='*80}")
     print(f"Total time: {total_elapsed/3600:.1f} hours")
-    print(f"\nResults:")
+    print(f"\nData Split:")
+    print(f"  Train: {len(train_df)} rows")
+    print(f"  Val: {len(val_df)} rows")
+    print(f"\nTraining Results:")
     for cluster_id, success in results.items():
         status = "[OK]" if success else "[FAILED]"
         print(f"  Cluster {cluster_id}: {status}")
