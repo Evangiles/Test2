@@ -46,11 +46,17 @@ def train_cluster(cluster_id: int, train_data_path: str):
 
     start_time = time.time()
 
+    # Auto-detect paths relative to PROJECT_ROOT
+    cluster_config_path = os.path.join(PROJECT_ROOT, "clustering_results", "cluster_assignments.json")
+    output_dir = os.path.join(PROJECT_ROOT, "trained_models")
+
     cmd = [
         "python",
-        f"{PROJECT_ROOT}/training/train_denoiser.py",
+        os.path.join(PROJECT_ROOT, "training", "train_denoiser.py"),
         "--cluster_id", str(cluster_id),
         "--data_path", train_data_path,
+        "--cluster_config", cluster_config_path,
+        "--output_dir", output_dir,
         "--epochs", str(CONFIG["epochs"]),
         "--batch_size", str(CONFIG["batch_size"]),
         "--device", CONFIG["device"],
