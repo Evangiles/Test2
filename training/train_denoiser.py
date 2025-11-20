@@ -127,7 +127,9 @@ def train_epoch(
 ):
     """Train for one epoch with optional gradient accumulation."""
     model.train()
-    total_loss = 0.0
+    total_loss_sum = 0.0
+    mse_loss_sum = 0.0
+    guide_loss_sum = 0.0
     optimizer.zero_grad()
 
     for batch_idx, batch in enumerate(tqdm(dataloader, desc="Training")):
@@ -150,19 +152,19 @@ def train_epoch(
         predicted_x0 = (x_t - torch.sqrt(1.0 - alpha_bar) * predicted_noise) / (torch.sqrt(alpha_bar) + 1e-8)
         predicted_x0 = torch.clamp(predicted_x0, -10, 10)  # Prevent extreme values
 
-        # Compute loss
-        loss = loss_fn(predicted_noise, noise, predicted_x0)
+        # Compute loss (returns 3 values)
+        total_loss, mse_loss, guide_loss = loss_fn(predicted_noise, noise, predicted_x0)
 
         # Check for NaN
-        if torch.isnan(loss) or torch.isinf(loss):
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
             print(f"\n⚠️  NaN/Inf detected in loss! Skipping batch...")
             continue
 
         # Scale loss for gradient accumulation
-        loss = loss / accumulation_steps
+        total_loss_scaled = total_loss / accumulation_steps
 
         # Backward
-        loss.backward()
+        total_loss_scaled.backward()
 
         # Update weights every accumulation_steps
         if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
@@ -171,9 +173,17 @@ def train_epoch(
             optimizer.step()
             optimizer.zero_grad()
 
-        total_loss += loss.item() * accumulation_steps
+        # Accumulate losses (unscaled)
+        total_loss_sum += total_loss.item()
+        mse_loss_sum += mse_loss.item()
+        guide_loss_sum += guide_loss.item()
 
-    return total_loss / len(dataloader)
+    n_batches = len(dataloader)
+    return (
+        mse_loss_sum / n_batches,
+        guide_loss_sum / n_batches,
+        total_loss_sum / n_batches
+    )
 
 
 def main():
@@ -331,10 +341,10 @@ def main():
     # Training loop with early stopping
     print(f"\nStarting training (max {args.epochs} epochs)...")
     if args.target_loss is not None:
-        print(f"  Target loss: {args.target_loss:.6f} (early stop when reached)")
+        print(f"  Target MSE loss: {args.target_loss:.6f} (early stop when reached)")
     print(f"  Patience: {args.patience} epochs (stop if no improvement)")
 
-    best_loss = float('inf')
+    best_mse = float('inf')
     epochs_without_improvement = 0
 
     for epoch in range(args.epochs):
@@ -343,13 +353,13 @@ def main():
         for param_group in optimizer.param_groups:
             param_group['lr'] = args.lr * lr_scale
 
-        avg_loss = train_epoch(model, dataloader, sde, loss_fn, optimizer, args.device, args.accumulation_steps)
+        avg_mse, avg_guide, avg_total = train_epoch(model, dataloader, sde, loss_fn, optimizer, args.device, args.accumulation_steps)
 
-        print(f"Epoch {epoch+1}/{args.epochs} - Loss: {avg_loss:.6f}, LR: {args.lr * lr_scale:.6f}")
+        print(f"Epoch {epoch+1}/{args.epochs} - MSE: {avg_mse:.6f}, Guidance: {avg_guide:.6f}, Total: {avg_total:.6f}, LR: {args.lr * lr_scale:.6f}")
 
-        # Check for improvement
-        if avg_loss < best_loss - args.min_delta:
-            best_loss = avg_loss
+        # Check for improvement (based on MSE only)
+        if avg_mse < best_mse - args.min_delta:
+            best_mse = avg_mse
             epochs_without_improvement = 0
 
             # Save best model
@@ -361,7 +371,9 @@ def main():
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'loss': avg_loss,
+                'mse_loss': avg_mse,
+                'guidance_loss': avg_guide,
+                'total_loss': avg_total,
                 'cluster_id': args.cluster_id,
                 'cluster_type': cluster_type,
                 'feature_names': feature_names,
@@ -374,10 +386,10 @@ def main():
 
             print(f"  → Saved checkpoint to {checkpoint_path}")
 
-            # Check if target loss reached
-            if args.target_loss is not None and avg_loss <= args.target_loss:
-                print(f"\n[Early Stop] Target loss {args.target_loss:.6f} reached!")
-                print(f"  Final loss: {avg_loss:.6f} at epoch {epoch+1}")
+            # Check if target MSE loss reached
+            if args.target_loss is not None and avg_mse <= args.target_loss:
+                print(f"\n[Early Stop] Target MSE loss {args.target_loss:.6f} reached!")
+                print(f"  Final MSE: {avg_mse:.6f} at epoch {epoch+1}")
                 break
         else:
             epochs_without_improvement += 1
@@ -386,10 +398,10 @@ def main():
             # Check patience
             if epochs_without_improvement >= args.patience:
                 print(f"\n[Early Stop] No improvement for {args.patience} epochs")
-                print(f"  Best loss: {best_loss:.6f}")
+                print(f"  Best MSE: {best_mse:.6f}")
                 break
 
-    print(f"\nTraining completed! Best loss: {best_loss:.6f}")
+    print(f"\nTraining completed! Best MSE: {best_mse:.6f}")
 
 
 if __name__ == "__main__":

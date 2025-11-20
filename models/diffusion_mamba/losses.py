@@ -229,7 +229,7 @@ class DenoisingLoss(nn.Module):
         predicted_noise: torch.Tensor,
         true_noise: torch.Tensor,
         denoised_output: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+    ) -> tuple:
         """
         Compute total loss.
 
@@ -239,19 +239,21 @@ class DenoisingLoss(nn.Module):
             denoised_output: Denoised signal (for guidance loss)
 
         Returns:
-            Total loss
+            (total_loss, mse_loss, weighted_guidance_loss)
         """
         # Reconstruction loss
-        recon_loss = self.mse_loss(predicted_noise, true_noise)
+        mse_loss = self.mse_loss(predicted_noise, true_noise)
 
         # Guidance loss (if provided)
         if self.guidance_loss is not None and denoised_output is not None:
-            guide_loss = self.guidance_loss(denoised_output)
-            total_loss = recon_loss + self.guidance_weight * guide_loss
+            guide_loss_raw = self.guidance_loss(denoised_output)
+            weighted_guide_loss = self.guidance_weight * guide_loss_raw
+            total_loss = mse_loss + weighted_guide_loss
         else:
-            total_loss = recon_loss
+            weighted_guide_loss = torch.tensor(0.0, device=mse_loss.device)
+            total_loss = mse_loss
 
-        return total_loss
+        return total_loss, mse_loss, weighted_guide_loss
 
 
 if __name__ == "__main__":
