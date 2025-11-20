@@ -186,10 +186,13 @@ def main():
     parser.add_argument("--d_model", type=int, default=128)
     parser.add_argument("--n_layers", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--lr", type=float, default=5e-4)  # Empirically validated
+    parser.add_argument("--epochs", type=int, default=100, help="Maximum training epochs")
+    parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
     parser.add_argument("--guidance_weight", type=float, default=0.1)
     parser.add_argument("--accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
+    parser.add_argument("--target_loss", type=float, default=None, help="Stop when loss reaches this value (early stopping)")
+    parser.add_argument("--patience", type=int, default=15, help="Early stopping patience (epochs without improvement)")
+    parser.add_argument("--min_delta", type=float, default=1e-5, help="Minimum loss improvement to reset patience")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
     args = parser.parse_args()
@@ -276,9 +279,14 @@ def main():
             return (epoch + 1) / warmup_epochs
         return 1.0
 
-    # Training loop
-    print(f"\nStarting training for {args.epochs} epochs...")
+    # Training loop with early stopping
+    print(f"\nStarting training (max {args.epochs} epochs)...")
+    if args.target_loss is not None:
+        print(f"  Target loss: {args.target_loss:.6f} (early stop when reached)")
+    print(f"  Patience: {args.patience} epochs (stop if no improvement)")
+
     best_loss = float('inf')
+    epochs_without_improvement = 0
 
     for epoch in range(args.epochs):
         # Apply learning rate warmup
@@ -290,9 +298,12 @@ def main():
 
         print(f"Epoch {epoch+1}/{args.epochs} - Loss: {avg_loss:.6f}, LR: {args.lr * lr_scale:.6f}")
 
-        # Save best model
-        if avg_loss < best_loss:
+        # Check for improvement
+        if avg_loss < best_loss - args.min_delta:
             best_loss = avg_loss
+            epochs_without_improvement = 0
+
+            # Save best model
             output_dir = Path(args.output_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -309,12 +320,25 @@ def main():
                 'window_size': args.window_size,
                 'd_model': args.d_model,
                 'n_layers': args.n_layers,
-                # NOTE: No normalization statistics needed (using Instance Normalization)
-                # Each window is normalized independently during inference
-                'normalization_type': 'instance',  # marker for inference code
+                'normalization_type': 'instance',
             }, checkpoint_path)
 
             print(f"  → Saved checkpoint to {checkpoint_path}")
+
+            # Check if target loss reached
+            if args.target_loss is not None and avg_loss <= args.target_loss:
+                print(f"\n[Early Stop] Target loss {args.target_loss:.6f} reached!")
+                print(f"  Final loss: {avg_loss:.6f} at epoch {epoch+1}")
+                break
+        else:
+            epochs_without_improvement += 1
+            print(f"  No improvement for {epochs_without_improvement} epochs")
+
+            # Check patience
+            if epochs_without_improvement >= args.patience:
+                print(f"\n[Early Stop] No improvement for {args.patience} epochs")
+                print(f"  Best loss: {best_loss:.6f}")
+                break
 
     print(f"\nTraining completed! Best loss: {best_loss:.6f}")
 

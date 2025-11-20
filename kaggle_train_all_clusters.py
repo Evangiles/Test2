@@ -28,12 +28,15 @@ TRAIN_CSV_PATH = os.path.join(PROJECT_ROOT, "train.csv")
 # Training configuration
 CONFIG = {
     "epochs": 100,
+    "lr": 5e-4,          # Learning rate
     "batch_size": 32,
     "device": "cuda",
     "window_size": 60,
     "d_model": 128,
     "n_layers": 4,
     "guidance_weight": 0.1,
+    "target_loss": 0.2,  # Early stopping: stop when loss reaches this value
+    "patience": 15,      # Early stopping: stop if no improvement for N epochs
     "train_ratio": 0.8,  # 80% train, 20% val
     "embargo_days": 0,   # Buffer days between train/val
 }
@@ -58,12 +61,15 @@ def train_cluster(cluster_id: int, train_data_path: str):
         "--cluster_config", cluster_config_path,
         "--output_dir", output_dir,
         "--epochs", str(CONFIG["epochs"]),
+        "--lr", str(CONFIG["lr"]),
         "--batch_size", str(CONFIG["batch_size"]),
         "--device", CONFIG["device"],
         "--window_size", str(CONFIG["window_size"]),
         "--d_model", str(CONFIG["d_model"]),
         "--n_layers", str(CONFIG["n_layers"]),
         "--guidance_weight", str(CONFIG["guidance_weight"]),
+        "--target_loss", str(CONFIG["target_loss"]),
+        "--patience", str(CONFIG["patience"]),
     ]
 
     try:
