@@ -50,6 +50,7 @@ evaluation_results/
 # Data
 *.csv
 !clustering_results/*.csv
+!train.csv
 
 # OS
 .DS_Store

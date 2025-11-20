@@ -21,9 +21,9 @@ import subprocess
 from pathlib import Path
 import time
 
-# Kaggle paths (auto-detected)
-PROJECT_ROOT = "/kaggle/working/FinancialDenoising"
-TRAIN_CSV_PATH = f"{PROJECT_ROOT}/train.csv"  # Should be in uploaded dataset
+# Kaggle paths (auto-detected from script location)
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+TRAIN_CSV_PATH = os.path.join(PROJECT_ROOT, "train.csv")
 
 # Training configuration
 CONFIG = {
