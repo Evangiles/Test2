@@ -117,6 +117,12 @@ def main():
         default=42,
         help='Random seed for reproducibility'
     )
+    parser.add_argument(
+        '--n_clusters',
+        type=int,
+        default=None,
+        help='Force specific number of clusters (skips optimal K selection)'
+    )
 
     args = parser.parse_args()
 
@@ -195,13 +201,19 @@ def main():
         random_state=args.random_state
     )
 
-    viz_path = output_dir / 'k_selection.png' if args.visualize else None
-    optimal_k = manager.find_optimal_k(
-        feature_matrix,
-        method=args.method,
-        visualize=args.visualize,
-        save_path=viz_path
-    )
+    if args.n_clusters is not None:
+        # Force specific K (skip optimization)
+        optimal_k = args.n_clusters
+        print(f"Using forced K={optimal_k} (skipping optimization)")
+    else:
+        # Find optimal K
+        viz_path = output_dir / 'k_selection.png' if args.visualize else None
+        optimal_k = manager.find_optimal_k(
+            feature_matrix,
+            method=args.method,
+            visualize=args.visualize,
+            save_path=viz_path
+        )
 
     # -------------------------------------------------------------------------
     # Step 5: Cluster Fitting
