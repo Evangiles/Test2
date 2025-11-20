@@ -247,6 +247,10 @@ class BiMambaBlock(nn.Module):
     Bidirectional Mamba block for processing sequences in both directions.
 
     Processes temporal dimension bidirectionally for better context modeling.
+
+    ⚠️ WARNING: NOT suitable for real-time trading!
+    This block uses future information (backward pass), which causes data leakage
+    in causal prediction tasks. Use CausalMambaBlock for trading applications.
     """
 
     def __init__(
@@ -295,6 +299,55 @@ class BiMambaBlock(nn.Module):
         return output
 
 
+class CausalMambaBlock(nn.Module):
+    """
+    Causal (unidirectional) Mamba block for real-time trading.
+
+    ✅ TRADING-READY: Only uses past information (forward direction).
+    Ensures h_t = f(x_1, ..., x_t), never accessing x_{t+1} or beyond.
+
+    Recommended for:
+    - Real-time financial prediction
+    - Live trading systems
+    - Kaggle API environments
+    - Any scenario requiring strict causality
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 16,
+        expand_factor: int = 2,
+        dropout: float = 0.0,
+    ):
+        """
+        Args:
+            d_model: Model dimension
+            d_state: SSM state dimension
+            expand_factor: Expansion factor
+            dropout: Dropout probability
+        """
+        super().__init__()
+
+        # Only forward direction (causal)
+        self.forward_block = MambaBlock(d_model, d_state, expand_factor, dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Causal forward pass - only uses past context.
+
+        Args:
+            x: [batch, seq_len, d_model]
+
+        Returns:
+            [batch, seq_len, d_model]
+        """
+        # Forward direction only (no backward pass = no future leakage)
+        output = self.forward_block(x)
+
+        return output
+
+
 if __name__ == "__main__":
     # Test
     print("Testing Mamba blocks...")
@@ -320,4 +373,24 @@ if __name__ == "__main__":
     out = bi_mamba(x)
     print(f"BiMambaBlock output shape: {out.shape}")
 
-    print("✓ All tests passed!")
+    # Test CausalMambaBlock
+    causal_mamba = CausalMambaBlock(d_model)
+    out = causal_mamba(x)
+    print(f"CausalMambaBlock output shape: {out.shape}")
+
+    # Verify causality: output at time t should not depend on x[t+1:]
+    print("\n[Causality test]")
+    x_test = torch.randn(1, 10, d_model)
+    x_modified = x_test.clone()
+    x_modified[0, 5:, :] = torch.randn_like(x_modified[0, 5:, :])  # Change future
+
+    out_original = causal_mamba(x_test)
+    out_modified = causal_mamba(x_modified)
+
+    # Check: output[:5] should be identical
+    diff = torch.abs(out_original[0, :5] - out_modified[0, :5]).max().item()
+    print(f"  Max difference in past outputs (should be ~0): {diff:.6f}")
+    assert diff < 1e-5, "Causality violated! Past outputs changed when future changed."
+    print("  [OK] Causality preserved: past outputs unchanged")
+
+    print("\n[OK] All tests passed!")

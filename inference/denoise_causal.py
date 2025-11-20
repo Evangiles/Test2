@@ -31,7 +31,7 @@ from tqdm import tqdm
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
 
-from models.diffusion_mamba import MultivariateMambaDenoiser, VPSDE
+from models.diffusion_mamba import CausalMambaDenoiser, VPSDE
 
 
 def load_cluster_config(config_path: Path):
@@ -41,10 +41,10 @@ def load_cluster_config(config_path: Path):
 
 
 def load_model_checkpoint(checkpoint_path: Path, device: str):
-    """Load trained model from checkpoint."""
+    """Load trained CausalMambaDenoiser from checkpoint."""
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
-    model = MultivariateMambaDenoiser(
+    model = CausalMambaDenoiser(
         n_features=checkpoint['n_features'],
         window_size=checkpoint['window_size'],
         d_model=checkpoint['d_model'],
@@ -59,75 +59,84 @@ def load_model_checkpoint(checkpoint_path: Path, device: str):
 
 @torch.no_grad()
 def denoise_single_window(
-    model: MultivariateMambaDenoiser,
-    window: np.ndarray,
+    model: CausalMambaDenoiser,
+    window_raw: np.ndarray,
     sde: VPSDE,
     device: str,
     num_steps: int = 50
 ) -> np.ndarray:
     """
-    Denoise a single window and return ONLY the last row.
+    Denoise a single window using INSTANCE NORMALIZATION.
 
     Args:
-        model: Trained denoiser
-        window: [window_size, n_features] normalized
+        model: Trained CausalMambaDenoiser
+        window_raw: [window_size, n_features] RAW (unnormalized)
         sde: VP-SDE for reverse diffusion
         device: Device
-        num_steps: Number of denoising steps
+        num_steps: Number of denoising steps (currently unused, for future DDIM)
 
     Returns:
-        Last row of denoised window [n_features]
+        Last row of denoised window [n_features] in ORIGINAL SCALE
     """
-    # Convert to tensor
-    window_tensor = torch.FloatTensor(window).unsqueeze(0).to(device)  # [1, W, F]
+    # INSTANCE NORMALIZATION (key for scale invariance!)
+    window_mean = window_raw.mean()
+    window_std = window_raw.std()
+    window_norm = (window_raw - window_mean) / (window_std + 1e-6)
 
-    # Denoise at middle timestep
+    # Convert to tensor
+    window_tensor = torch.FloatTensor(window_norm).unsqueeze(0).to(device)  # [1, W, F]
+
+    # Denoise at middle timestep (single-step for now)
     t = torch.full((1,), sde.num_timesteps // 2, device=device, dtype=torch.long)
 
     # Model predicts NOISE (not clean signal!)
     predicted_noise = model(window_tensor, t)  # [1, W, F]
 
-    # Recover clean signal using VP-SDE formula: x0 = (x_t - sqrt(1-alpha_bar) * noise) / sqrt(alpha_bar)
+    # Recover clean signal using VP-SDE formula
     alpha_bar = sde.alphas_cumprod[t]
     while alpha_bar.dim() < window_tensor.dim():
         alpha_bar = alpha_bar.unsqueeze(-1)
 
-    denoised_window = (window_tensor - torch.sqrt(1.0 - alpha_bar) * predicted_noise) / (torch.sqrt(alpha_bar) + 1e-8)
-    denoised_window = torch.clamp(denoised_window, -10, 10)  # Stability
+    denoised_window_norm = (window_tensor - torch.sqrt(1.0 - alpha_bar) * predicted_noise) / (torch.sqrt(alpha_bar) + 1e-8)
+    denoised_window_norm = torch.clamp(denoised_window_norm, -10, 10)  # Stability
 
-    # Return ONLY the last row (causal!)
-    return denoised_window[0, -1, :].cpu().numpy()  # [F]
+    # Extract last row (causal!)
+    denoised_last_norm = denoised_window_norm[0, -1, :].cpu().numpy()  # [F]
+
+    # DENORMALIZE back to original scale
+    denoised_last = denoised_last_norm * window_std + window_mean
+
+    return denoised_last  # [F]
 
 
 def denoise_causal(
     data: pd.DataFrame,
     feature_names: list,
-    model: MultivariateMambaDenoiser,
-    train_mean: np.ndarray,
-    train_std: np.ndarray,
+    model: CausalMambaDenoiser,
     sde: VPSDE,
     device: str,
     window_size: int = 60,
     num_steps: int = 50
 ) -> np.ndarray:
     """
-    Causal denoising: Each row uses ONLY past data.
+    Causal denoising with INSTANCE NORMALIZATION.
+
+    Each row uses ONLY past data (causal) and each window is normalized
+    independently (instance norm) for scale invariance.
 
     Args:
         data: Input dataframe
         feature_names: List of feature names for this cluster
-        model: Trained denoiser model
-        train_mean: Training normalization mean
-        train_std: Training normalization std
+        model: Trained CausalMambaDenoiser
         sde: VP-SDE
         device: Device
         window_size: Window size (default 60)
         num_steps: Denoising steps
 
     Returns:
-        Denoised features [T, n_features]
+        Denoised features [T, n_features] in ORIGINAL SCALE
     """
-    # Extract feature data
+    # Extract feature data (keep RAW)
     feature_data = data[feature_names].values
     feature_data = np.nan_to_num(feature_data, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -135,25 +144,20 @@ def denoise_causal(
     n_features = len(feature_names)
     denoised = np.zeros((T, n_features), dtype=np.float32)
 
-    print(f"  Causal denoising {T} rows (stride=1)...")
+    print(f"  Causal denoising {T} rows (stride=1, instance norm)...")
 
     for t in tqdm(range(T), desc="  Processing", leave=False):
         if t < window_size - 1:
-            # Insufficient history → use original (or partial window)
+            # Insufficient history → use original
             denoised[t] = feature_data[t]
             continue
 
-        # Window [t-59:t] (past 60 rows including current)
-        window = feature_data[t - window_size + 1:t + 1]  # [60, n_features]
+        # Window [t-59:t+1] (past 60 rows including current)
+        window_raw = feature_data[t - window_size + 1:t + 1]  # [60, n_features]
 
-        # Normalize using TRAINING statistics
-        window_norm = (window - train_mean) / train_std
-
-        # Denoise and extract ONLY last row
-        denoised[t] = denoise_single_window(model, window_norm, sde, device, num_steps)
-
-        # Denormalize
-        denoised[t] = denoised[t] * train_std + train_mean
+        # Denoise with instance normalization (handled inside function)
+        # Returns denormalized output in original scale
+        denoised[t] = denoise_single_window(model, window_raw, sde, device, num_steps)
 
     return denoised
 
@@ -218,27 +222,21 @@ def main():
             continue
 
         model, checkpoint = load_model_checkpoint(model_path, args.device)
-        print(f"✓ Loaded model from {model_path}")
+        print(f"[OK] Loaded CausalMambaDenoiser from {model_path}")
 
-        # CRITICAL: Load training normalization statistics
-        if 'normalization_mean' not in checkpoint or 'normalization_std' not in checkpoint:
-            raise ValueError(
-                f"Checkpoint {model_path} missing normalization statistics!\n"
-                "Please retrain the model with updated training code."
-            )
+        # Check normalization type
+        norm_type = checkpoint.get('normalization_type', 'global')
+        if norm_type == 'instance':
+            print(f"  Using Instance Normalization (scale-invariant)")
+        else:
+            print(f"  WARNING: Old model with global normalization!")
+            print(f"  Consider retraining with updated code for better performance.")
 
-        train_mean = np.array(checkpoint['normalization_mean'])
-        train_std = np.array(checkpoint['normalization_std'])
-        print(f"  Loaded training statistics (mean: [{train_mean.min():.4f}, {train_mean.max():.4f}], "
-              f"std: [{train_std.min():.4f}, {train_std.max():.4f}])")
-
-        # Causal denoising
+        # Causal denoising with Instance Normalization
         denoised_features = denoise_causal(
             df,
             feature_names,
             model,
-            train_mean,
-            train_std,
             sde,
             args.device,
             args.window_size,

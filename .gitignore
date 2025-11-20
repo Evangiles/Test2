@@ -24,6 +24,7 @@ wheels/
 venv/
 env/
 ENV/
+.venv/
 
 # IDE
 .vscode/
@@ -57,3 +58,14 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# UV package manager
+uv.lock
+.python-version
+src/
+
+# Claude Code settings (personal)
+.claude/
+
+# Large files
+*.pdf

@@ -23,7 +23,7 @@ from tqdm import tqdm
 sys.path.append(str(Path(__file__).parent.parent))
 
 from models.diffusion_mamba import (
-    MultivariateMambaDenoiser,
+    CausalMambaDenoiser,
     VPSDE,
     DenoisingLoss
 )
@@ -31,12 +31,17 @@ from models.diffusion_mamba import (
 
 class TimeSeriesWindowDataset(Dataset):
     """
-    Dataset for windowed multivariate time series.
+    Dataset for windowed multivariate time series with INSTANCE NORMALIZATION.
 
-    Creates sliding windows from time series data.
+    Creates sliding windows from time series data and normalizes each window
+    independently using its own statistics. This ensures:
+    1. No data leakage between train/val
+    2. Scale invariance (robust to price regime changes)
+    3. Model learns relative patterns, not absolute values
 
-    IMPORTANT: Normalization statistics must be pre-computed externally
-    to prevent validation leakage when creating separate train/val datasets.
+    Key difference from global normalization:
+    - Global: window_norm = (window - train_mean) / train_std  (leaks scale info)
+    - Instance: window_norm = (window - window.mean()) / window.std()  (scale-free)
     """
 
     def __init__(
@@ -44,9 +49,7 @@ class TimeSeriesWindowDataset(Dataset):
         data: pd.DataFrame,
         feature_cols: list,
         window_size: int = 60,
-        stride: int = 1,
-        normalization_mean: np.ndarray = None,
-        normalization_std: np.ndarray = None
+        stride: int = 1
     ):
         """
         Args:
@@ -54,41 +57,46 @@ class TimeSeriesWindowDataset(Dataset):
             feature_cols: List of feature column names
             window_size: Window size
             stride: Stride for sliding window
-            normalization_mean: Pre-computed mean for normalization (required)
-            normalization_std: Pre-computed std for normalization (required)
         """
         self.window_size = window_size
         self.feature_cols = feature_cols
 
-        # Extract feature data
+        # Extract feature data (keep raw, normalize in __getitem__)
         feature_data = data[feature_cols].values  # [T, F]
 
         # Handle NaN and inf
         feature_data = np.nan_to_num(feature_data, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Use pre-computed normalization statistics
-        if normalization_mean is None or normalization_std is None:
-            raise ValueError(
-                "normalization_mean and normalization_std must be provided to prevent data leakage. "
-                "Compute statistics externally before creating dataset."
-            )
-
-        feature_data = (feature_data - normalization_mean) / normalization_std
-
-        # Create windows
+        # Create windows (store raw data, normalize per-instance)
         self.windows = []
         for i in range(0, len(feature_data) - window_size + 1, stride):
             window = feature_data[i:i + window_size]
             self.windows.append(window)
 
-        self.windows = np.array(self.windows)  # [N, W, F]
+        self.windows = np.array(self.windows, dtype=np.float32)  # [N, W, F]
 
     def __len__(self):
         return len(self.windows)
 
     def __getitem__(self, idx):
-        window = torch.FloatTensor(self.windows[idx])  # [W, F]
-        return window
+        """
+        Returns instance-normalized window.
+
+        Normalization is applied PER WINDOW to ensure:
+        - No leakage of global statistics
+        - Robustness to price regime changes
+        - Model learns shape, not absolute scale
+        """
+        window = self.windows[idx].copy()  # [W, F]
+
+        # Instance normalization: use window's own statistics
+        window_mean = window.mean()
+        window_std = window.std()
+
+        # Normalize
+        window_norm = (window - window_mean) / (window_std + 1e-6)
+
+        return torch.FloatTensor(window_norm)  # [W, F]
 
 
 def load_cluster_config(config_path: Path):
@@ -213,26 +221,16 @@ def main():
         print(f"    Expected 'train_only.csv' to prevent validation leakage!")
         print(f"    Proceeding anyway, but ensure this is intentional.\n")
 
-    # Pre-compute normalization statistics from training data
-    # This must be done BEFORE creating dataset to prevent leakage
-    print(f"\nComputing normalization statistics...")
-    feature_data = df[feature_names].values
-    feature_data = np.nan_to_num(feature_data, nan=0.0, posinf=0.0, neginf=0.0)
+    # Create dataset with INSTANCE NORMALIZATION (no global statistics needed!)
+    print(f"\nCreating dataset...")
+    print(f"  Using Instance Normalization (per-window statistics)")
+    print(f"  This ensures scale-invariance and prevents data leakage")
 
-    normalization_mean = np.mean(feature_data, axis=0, keepdims=True)
-    normalization_std = np.std(feature_data, axis=0, keepdims=True) + 1e-8
-
-    print(f"  Mean range: [{normalization_mean.min():.6f}, {normalization_mean.max():.6f}]")
-    print(f"  Std range:  [{normalization_std.min():.6f}, {normalization_std.max():.6f}]")
-
-    # Create dataset with pre-computed statistics
     dataset = TimeSeriesWindowDataset(
         df,
         feature_names,
         window_size=args.window_size,
-        stride=1,
-        normalization_mean=normalization_mean,
-        normalization_std=normalization_std
+        stride=1
     )
     print(f"Created {len(dataset)} windows")
 
@@ -244,9 +242,12 @@ def main():
         pin_memory=True if args.device == "cuda" else False
     )
 
-    # Initialize model
-    print(f"\nInitializing model...")
-    model = MultivariateMambaDenoiser(
+    # Initialize CAUSAL model (trading-ready, no future leakage)
+    print(f"\nInitializing CausalMambaDenoiser...")
+    print(f"  This model uses forward-only Mamba (no backward pass)")
+    print(f"  Suitable for real-time trading deployment")
+
+    model = CausalMambaDenoiser(
         n_features=len(feature_names),
         window_size=args.window_size,
         d_model=args.d_model,
@@ -308,9 +309,9 @@ def main():
                 'window_size': args.window_size,
                 'd_model': args.d_model,
                 'n_layers': args.n_layers,
-                # CRITICAL: Save normalization statistics for leak-free inference
-                'normalization_mean': normalization_mean.tolist(),
-                'normalization_std': normalization_std.tolist(),
+                # NOTE: No normalization statistics needed (using Instance Normalization)
+                # Each window is normalized independently during inference
+                'normalization_type': 'instance',  # marker for inference code
             }, checkpoint_path)
 
             print(f"  → Saved checkpoint to {checkpoint_path}")
